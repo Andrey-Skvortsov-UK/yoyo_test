@@ -13,12 +13,12 @@ Javascripts) and links between pages.
 Warning : This script only works with ***Python3***
 
 ## Setup Instructions
-- $ pip install -r requirements.txt
+- $ pip install aiohttp bs4
 
 ### Simple usage
 
-- $ python main.py
+- $ python crawler.py -url "http://www.bbc.co.uk/" -max_visited 100
 
-- $ python crawler.py -url "http://www.zyvra.org/"
+- $ python crawler.py -url "http://www.bbc.co.uk/" -output_sitemap "out_sitemap.txt" -max_visited 100
 
-- $ python crawler.py -url "http://www.zyvra.org/" -output_sitemap "out_sitemap.txt"
+- $ python crawler.py -url "http://www.bbc.co.uk/" -threads 10 -max_visited 100

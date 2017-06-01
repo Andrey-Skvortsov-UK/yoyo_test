@@ -1,16 +1,30 @@
-import argparse
 import sys
+import argparse
 from urllib.parse import urlparse
-import requests
+import asyncio
+from asyncio import Queue
 
+import aiohttp
 import bs4
 
 
 class Crawler:
-    def __init__(self, url, output_sitemap_file='sitemap.txt', output_assets_file='assets.txt', log_file='error.log'):
+    def __init__(self, url,
+                 output_sitemap_file='sitemap.txt',
+                 output_assets_file='assets.txt',
+                 log_file='error.log',
+                 thread_cnt=8, max_urls_visited=1000):
         """
         Crawler class provide gettin sitemap and collect assets
         for each page (e.g. CSS, Images, Javascripts) and links between pages
+
+        Parameters:
+            url - Given URl,
+            output_sitemap_file - Sitemap file name,
+            output_assets_file - Assets file name,
+            log_file - Error log file name,
+            thread_cnt - Count of treads for crawling,
+            max_urls_visited - Max count of visited urls (stop if reach this number)
         """
         url = urlparse(url)
         self.scheme = url.scheme
@@ -19,9 +33,17 @@ class Crawler:
         self.log_file = open(log_file, 'a')
         self.output_sitemap_file = output_sitemap_file
         self.output_assets_file = output_assets_file
+        loop = asyncio.get_event_loop()
+        self.session = aiohttp.ClientSession(loop=loop)
+        self.queue = Queue(loop=loop)
+        self.queue.put_nowait(self.url)
+        self.loop = loop
+        self.workers_cnt = thread_cnt
         self.urls = set([self.url])
         self.visited = set([])
+        self.max_urls = max_urls_visited
         self.assets = {}
+        self.urls_adds = 0
         self.exclude_res = ('.iso', '.rar', '.tar', '.tgz', '.zip', '.dmg', '.exe',
                             '.avi', '.mkv', '.mp4',
                             '.jpg', '.jpeg', '.png', '.gif', '.pdf' )
@@ -52,52 +74,85 @@ class Crawler:
     def is_valid(self, url):
         if self.netloc != url.netloc:
             return False
-        return True
+        elif url.path.endswith(self.exclude_res):
+            return False
+        else:
+            return True
 
-    def run(self):
-        """
-          Main crawl loop
-        """
-        while self.urls:
-            self.parse()
+    async def check_max_url_visited(self):
+        if len(self.visited) > self.max_urls:
+            while True:
+                url = await self.queue.get()
+                self.queue.task_done()
 
+    async def run(self):
+        """Run the crawler until all finished."""
+        workers = [asyncio.Task(self.work(), loop=self.loop) for _ in range(self.workers_cnt)]
+        await self.queue.join()    # will be await all urls processed
+        for worker in workers:
+            worker.cancel()
         self.save_results()
         self.log_file.close()
 
-    def parse(self):
-        if not self.urls:
-            return
-        url = self.urls.pop()
+    async def work(self):
+        """
+          Main crawl loop
+        """
+        #while self.urls:
+        #    self.parse()
+        try:
+            """Infinit loop"""
+            while True:
+                await self.check_max_url_visited()
+                url = await self.queue.get()
+                try:
+                    if url in self.visited:
+                        continue
+                    try:
+                        response = await self.session.get(url, allow_redirects=False)
+                    except aiohttp.ClientError as client_error:
+                        self.errlog('Error occurred for url {}:{}'.format(url, client_error))
+                        #sys.exit(1)
+                    try:
+                        if response.status == 200:
+                            newurls, assets, short_url = await self.parse(response, url)
+                            self.visited.update([url])
+                            newurls = newurls.difference(self.visited)
+                            for newurl in newurls:
+                                self.queue.put_nowait(newurl)
+                            if short_url:
+                                self.assets[short_url] = assets
+                            self.urls_adds += len(newurls)
+                            print('Visited {} of {}. Added {} new urls'.format(len(self.visited), self.urls_adds, len(newurls)))
+                    finally:
+                        await response.release()
+                finally:
+                    self.queue.task_done()
+        except asyncio.CancelledError:    # to stop loop
+            pass
+
+    async  def parse(self, response, url):
+        newurls = set()
+        text = await response.text()
         _url = urlparse(url)
-        if url not in self.visited and not _url.path.endswith(self.exclude_res):
-            try:
-                response = requests.get(url)
-            except requests.exceptions.Timeout:
-                self.errlog('Timeout occurred for url {}'.format(url))
-                return
-            except requests.exceptions.TooManyRedirects:
-                self.errlog('Too Many Redirects for url {}'.format(url))
-                return
-            except requests.exceptions.RequestException as e:
-                # fatal error.
-                self.errlog("Error: {}".format(e))
-                sys.exit(1)
-            if response.status_code >= 400:
-                self.errlog("Error {} at url {}".format(response.status_code, url))
-                return
-            soup = bs4.BeautifulSoup(response.text)
+        if url not in self.visited and self.is_valid(_url):
+            soup = bs4.BeautifulSoup(text, "html.parser")
             try:
                 for link in soup.find_all('a', {'href': True}):
                     newurl = self.normalaze(_url, link['href'])
                     _newurl = urlparse(newurl)
                     newurl = _newurl.scheme + '://' + _newurl.netloc + _newurl.path
                     if self.is_valid(_newurl):
-                        self.urls.update([newurl])
-
+                        newurls.add(newurl)
             except Exception as e:
                 self.errlog(e.message)
-            self.visited.update([url])
-            self.parse_assets(_url, soup)
+
+            short_url = _url.path
+            if not short_url:
+                short_url = '/'
+            return newurls, self.parse_assets(_url, soup), short_url
+        else:
+            return set(), [], None
 
     def get_tags(self, _url, tag, attr, soup):
         for tags in soup.find_all(tag, {attr: True}):
@@ -105,13 +160,11 @@ class Crawler:
             yield val
 
     def parse_assets(self, _url, soup):
-        url = _url.path
-        if not url:
-            url = '/'
-        self.assets[url] = list(self.get_tags(_url, 'a', 'href', soup))
-        self.assets[url] += list(self.get_tags(_url, 'link', 'href', soup))
-        self.assets[url] += list(self.get_tags(_url, 'img', 'src', soup))
-        self.assets[url] += list(self.get_tags(_url, 'script', 'src', soup))
+        assets = list(self.get_tags(_url, 'a', 'href', soup))
+        assets += list(self.get_tags(_url, 'link', 'href', soup))
+        assets += list(self.get_tags(_url, 'img', 'src', soup))
+        assets += list(self.get_tags(_url, 'script', 'src', soup))
+        return assets
 
     def save_results(self):
         with open(self.output_sitemap_file, 'w') as file:
@@ -128,13 +181,23 @@ def parse_args():
     parser.add_argument('-output_sitemap', default='sitemap.txt', help='Sitemap file name')
     parser.add_argument('-output_assets', default='assets.txt', help='Assets file name')
     parser.add_argument('-log_file', default='error.log', help='Error log file name')
+    parser.add_argument('-threads', type=int, default=8, help='Count of treads for crawling')
+    parser.add_argument('-max_visited', type=int, default=8, help='Max count of visited urls')
     return parser
 
 
 if __name__ == '__main__':
     options = parse_args().parse_args(sys.argv[1:])
-    crl = Crawler(url = options.url,
-                  output_assets_file = options.output_assets,
-                  output_sitemap_file = options.output_sitemap,
-                  log_file = options.log_file)
-    crl.run()
+    crl = Crawler(url=options.url,
+                  output_assets_file=options.output_assets,
+                  output_sitemap_file=options.output_sitemap,
+                  log_file=options.log_file,
+                  thread_cnt=options.threads, max_urls_visited=options.max_visited)
+    #crl = Crawler(url='http://www.bbc.co.uk/')
+    loop = asyncio.get_event_loop()
+    future = asyncio.ensure_future(crl.run())
+    loop.run_until_complete(future)
+    crl.session.close()
+    loop.stop()
+    loop.run_forever()
+    loop.close()
